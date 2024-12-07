@@ -1,5 +1,7 @@
 import asyncio
 import html
+import io
+import csv
 import json
 import logging
 import os
@@ -7,7 +9,7 @@ import re
 from dataclasses import dataclass
 from functools import wraps
 from hashlib import md5
-from typing import Any, Union
+from typing import Any, Union, List
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -45,10 +47,27 @@ class EmbeddingFunc:
 
 def locate_json_string_body_from_string(content: str) -> Union[str, None]:
     """Locate the JSON string body from a string"""
-    maybe_json_str = re.search(r"{.*}", content, re.DOTALL)
-    if maybe_json_str is not None:
-        return maybe_json_str.group(0)
-    else:
+    try:
+        maybe_json_str = re.search(r"{.*}", content, re.DOTALL)
+        if maybe_json_str is not None:
+            maybe_json_str = maybe_json_str.group(0)
+            maybe_json_str = maybe_json_str.replace("\\n", "")
+            maybe_json_str = maybe_json_str.replace("\n", "")
+            maybe_json_str = maybe_json_str.replace("'", '"')
+            # json.loads(maybe_json_str) # don't check here, cannot validate schema after all
+            return maybe_json_str
+    except Exception:
+        pass
+        # try:
+        #     content = (
+        #         content.replace(kw_prompt[:-1], "")
+        #         .replace("user", "")
+        #         .replace("model", "")
+        #         .strip()
+        #     )
+        #     maybe_json_str = "{" + content.split("{")[1].split("}")[0] + "}"
+        #     json.loads(maybe_json_str)
+
         return None
 
 
@@ -175,10 +194,17 @@ def truncate_list_by_token_size(list_data: list, key: callable, max_token_size: 
     return list_data
 
 
-def list_of_list_to_csv(data: list[list]):
-    return "\n".join(
-        [",\t".join([str(data_dd) for data_dd in data_d]) for data_d in data]
-    )
+def list_of_list_to_csv(data: List[List[str]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(data)
+    return output.getvalue()
+
+
+def csv_string_to_list(csv_string: str) -> List[List[str]]:
+    output = io.StringIO(csv_string)
+    reader = csv.reader(output)
+    return [row for row in reader]
 
 
 def save_data_to_file(data, file_name):
@@ -244,3 +270,123 @@ def xml_to_json(xml_file):
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
+
+
+def process_combine_contexts(hl, ll):
+    header = None
+    list_hl = csv_string_to_list(hl.strip())
+    list_ll = csv_string_to_list(ll.strip())
+
+    if list_hl:
+        header = list_hl[0]
+        list_hl = list_hl[1:]
+    if list_ll:
+        header = list_ll[0]
+        list_ll = list_ll[1:]
+    if header is None:
+        return ""
+
+    if list_hl:
+        list_hl = [",".join(item[1:]) for item in list_hl if item]
+    if list_ll:
+        list_ll = [",".join(item[1:]) for item in list_ll if item]
+
+    combined_sources = []
+    seen = set()
+
+    for item in list_hl + list_ll:
+        if item and item not in seen:
+            combined_sources.append(item)
+            seen.add(item)
+
+    combined_sources_result = [",\t".join(header)]
+
+    for i, item in enumerate(combined_sources, start=1):
+        combined_sources_result.append(f"{i},\t{item}")
+
+    combined_sources_result = "\n".join(combined_sources_result)
+
+    return combined_sources_result
+
+
+async def get_best_cached_response(
+    hashing_kv,
+    current_embedding,
+    similarity_threshold=0.95,
+    mode="default",
+) -> Union[str, None]:
+    # Get mode-specific cache
+    mode_cache = await hashing_kv.get_by_id(mode)
+    if not mode_cache:
+        return None
+
+    best_similarity = -1
+    best_response = None
+    best_prompt = None
+    best_cache_id = None
+
+    # Only iterate through cache entries for this mode
+    for cache_id, cache_data in mode_cache.items():
+        if cache_data["embedding"] is None:
+            continue
+
+        # Convert cached embedding list to ndarray
+        cached_quantized = np.frombuffer(
+            bytes.fromhex(cache_data["embedding"]), dtype=np.uint8
+        ).reshape(cache_data["embedding_shape"])
+        cached_embedding = dequantize_embedding(
+            cached_quantized,
+            cache_data["embedding_min"],
+            cache_data["embedding_max"],
+        )
+
+        similarity = cosine_similarity(current_embedding, cached_embedding)
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_response = cache_data["return"]
+            best_prompt = cache_data["original_prompt"]
+            best_cache_id = cache_id
+
+    if best_similarity > similarity_threshold:
+        prompt_display = (
+            best_prompt[:50] + "..." if len(best_prompt) > 50 else best_prompt
+        )
+        log_data = {
+            "event": "cache_hit",
+            "mode": mode,
+            "similarity": round(best_similarity, 4),
+            "cache_id": best_cache_id,
+            "original_prompt": prompt_display,
+        }
+        logger.info(json.dumps(log_data, ensure_ascii=False))
+        return best_response
+    return None
+
+
+def cosine_similarity(v1, v2):
+    """Calculate cosine similarity between two vectors"""
+    dot_product = np.dot(v1, v2)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    return dot_product / (norm1 * norm2)
+
+
+def quantize_embedding(embedding: np.ndarray, bits=8) -> tuple:
+    """Quantize embedding to specified bits"""
+    # Calculate min/max values for reconstruction
+    min_val = embedding.min()
+    max_val = embedding.max()
+
+    # Quantize to 0-255 range
+    scale = (2**bits - 1) / (max_val - min_val)
+    quantized = np.round((embedding - min_val) * scale).astype(np.uint8)
+
+    return quantized, min_val, max_val
+
+
+def dequantize_embedding(
+    quantized: np.ndarray, min_val: float, max_val: float, bits=8
+) -> np.ndarray:
+    """Restore quantized embedding"""
+    scale = (max_val - min_val) / (2**bits - 1)
+    return (quantized * scale + min_val).astype(np.float32)
